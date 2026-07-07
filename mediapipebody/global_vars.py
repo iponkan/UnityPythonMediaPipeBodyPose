@@ -15,3 +15,10 @@ HEIGHT = 240
 
 # [0, 2] Higher numbers are more precise, but also cost more performance. Good environment conditions = 1, otherwise 2.
 MODEL_COMPLEXITY = 1
+
+# Landmark smoothing. Higher MIN_CUTOFF is more responsive but shakier.
+# Higher BETA follows fast motion better while keeping still poses stable.
+SMOOTH_LANDMARKS = True
+SMOOTH_MIN_CUTOFF = 0.35
+SMOOTH_BETA = 0.65
+SMOOTH_DERIVATIVE_CUTOFF = 1.0

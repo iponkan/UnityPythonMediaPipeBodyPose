@@ -9,6 +9,78 @@ import threading
 import time
 import global_vars 
 import struct
+import math
+
+
+class LowPassFilter:
+    def __init__(self):
+        self.initialized = False
+        self.value = None
+
+    def apply(self, value, alpha):
+        if not self.initialized:
+            self.value = value
+            self.initialized = True
+            return value
+
+        self.value = alpha * value + (1.0 - alpha) * self.value
+        return self.value
+
+
+class OneEuroFilter:
+    def __init__(self, min_cutoff, beta, derivative_cutoff):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.derivative_cutoff = derivative_cutoff
+        self.value_filter = LowPassFilter()
+        self.derivative_filter = LowPassFilter()
+        self.last_value = None
+
+    def alpha(self, cutoff, dt):
+        tau = 1.0 / (2.0 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def apply(self, value, dt):
+        if dt <= 0:
+            dt = 1.0 / max(global_vars.FPS, 1)
+
+        derivative = 0.0 if self.last_value is None else (value - self.last_value) / dt
+        smoothed_derivative = self.derivative_filter.apply(
+            derivative,
+            self.alpha(global_vars.SMOOTH_DERIVATIVE_CUTOFF, dt)
+        )
+        cutoff = self.min_cutoff + self.beta * abs(smoothed_derivative)
+        smoothed_value = self.value_filter.apply(value, self.alpha(cutoff, dt))
+        self.last_value = smoothed_value
+        return smoothed_value
+
+
+class LandmarkSmoother:
+    def __init__(self, landmark_count=33, dimensions=3):
+        self.filters = [
+            [
+                OneEuroFilter(
+                    global_vars.SMOOTH_MIN_CUTOFF,
+                    global_vars.SMOOTH_BETA,
+                    global_vars.SMOOTH_DERIVATIVE_CUTOFF
+                )
+                for _ in range(dimensions)
+            ]
+            for _ in range(landmark_count)
+        ]
+
+    def apply(self, landmarks, dt):
+        if not global_vars.SMOOTH_LANDMARKS:
+            return landmarks
+
+        smoothed = np.array(landmarks, dtype=np.float32, copy=True)
+        for landmark_index in range(smoothed.shape[0]):
+            for dimension in range(smoothed.shape[1]):
+                smoothed[landmark_index][dimension] = self.filters[landmark_index][dimension].apply(
+                    float(smoothed[landmark_index][dimension]),
+                    dt
+                )
+        return smoothed
 
 # the capture thread captures images from the WebCam on a separate thread (for performance)
 class CaptureThread(threading.Thread):
@@ -28,6 +100,7 @@ class CaptureThread(threading.Thread):
         time.sleep(1)
         
         print("Opened Capture @ %s fps"%str(self.cap.get(cv2.CAP_PROP_FPS)))
+        self.timer = time.time()
         while not global_vars.KILL_THREADS:
             self.ret, self.frame = self.cap.read()
             self.isRunning = True
@@ -46,6 +119,7 @@ class BodyThread(threading.Thread):
     pipe = None
     timeSinceCheckedConnection = 0
     timeSincePostStatistics = 0
+    lastPoseTime = None
 
     def compute_real_world_landmarks(self,world_landmarks,image_landmarks,image_shape):
         try:
@@ -83,85 +157,111 @@ class BodyThread(threading.Thread):
     def run(self):
         mp_drawing = mp.solutions.drawing_utils
         mp_pose = mp.solutions.pose
+        free_smoother = LandmarkSmoother()
+        anchored_smoother = LandmarkSmoother()
         
         capture = CaptureThread()
+        capture.daemon = True
         capture.start()
 
-        with mp_pose.Pose(min_detection_confidence=0.80, min_tracking_confidence=0.5, model_complexity = global_vars.MODEL_COMPLEXITY,static_image_mode = False,enable_segmentation = True) as pose: 
-            
-            while not global_vars.KILL_THREADS and capture.isRunning==False:
-                print("Waiting for camera and capture thread.")
-                time.sleep(0.5)
-            print("Beginning capture")
+        try:
+            with mp_pose.Pose(min_detection_confidence=0.80, min_tracking_confidence=0.5, model_complexity = global_vars.MODEL_COMPLEXITY,static_image_mode = False,enable_segmentation = True) as pose: 
                 
-            while not global_vars.KILL_THREADS and capture.cap.isOpened():
-                ti = time.time()
-
-                # Fetch stuff from the capture thread
-                ret = capture.ret
-                image = capture.frame
-                                
-                # Image transformations and stuff
-                #image = cv2.flip(image, 1)
-                image.flags.writeable = global_vars.DEBUG
-                
-                # Detections
-                results = pose.process(image)
-                tf = time.time()
-                
-                # Rendering results
-                if global_vars.DEBUG:
-                    if time.time()-self.timeSincePostStatistics>=1:
-                        print("Theoretical Maximum FPS: %f"%(1/(tf-ti)))
-                        self.timeSincePostStatistics = time.time()
-                        
-                    if results.pose_landmarks:
-                        mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS, 
-                                                mp_drawing.DrawingSpec(color=(255, 100, 0), thickness=2, circle_radius=4),
-                                                mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=2, circle_radius=2),
-                                                )
-                    cv2.imshow('Body Tracking', image)
-                    cv2.waitKey(1)
-
-                if self.pipe==None and time.time()-self.timeSinceCheckedConnection>=1:
-                    try:
-                        self.pipe = open(r'\\.\pipe\UnityMediaPipeBody', 'r+b', 0)
-                    except FileNotFoundError:
-                        print("Waiting for Unity project to run...")
-                        self.pipe = None
-                    self.timeSinceCheckedConnection = time.time()
+                while not global_vars.KILL_THREADS and capture.isRunning==False:
+                    print("Waiting for camera and capture thread.")
+                    time.sleep(0.5)
+                print("Beginning capture")
                     
-                if self.pipe != None:
-                    # Set up data for piping
-                    self.data = ""
-                    i = 0
-                    
-                    if results.pose_world_landmarks:
-                        image_landmarks = results.pose_landmarks
-                        world_landmarks = results.pose_world_landmarks
+                while not global_vars.KILL_THREADS and capture.cap.isOpened():
+                    ti = time.time()
 
-                        model_points = np.float32([[-l.x, -l.y, -l.z] for l in world_landmarks.landmark])
-                        image_points = np.float32([[l.x * image.shape[1], l.y * image.shape[0]] for l in image_landmarks.landmark])
-                        
-                        body_world_landmarks_world = self.compute_real_world_landmarks(model_points,image_points,image.shape)
-                        body_world_landmarks = results.pose_world_landmarks
-                        
-                        for i in range(0,33):
-                            self.data += "FREE|{}|{}|{}|{}\n".format(i,body_world_landmarks_world[i][0],body_world_landmarks_world[i][1],body_world_landmarks_world[i][2])
-                        for i in range(0,33):
-                            self.data += "ANCHORED|{}|{}|{}|{}\n".format(i,-body_world_landmarks.landmark[i].x,-body_world_landmarks.landmark[i].y,-body_world_landmarks.landmark[i].z)
-
+                    # Fetch stuff from the capture thread
+                    ret = capture.ret
+                    image = capture.frame
+                    if not ret or image is None:
+                        time.sleep(0.01)
+                        continue
+                                    
+                    # Image transformations and stuff
+                    #image = cv2.flip(image, 1)
+                    image.flags.writeable = global_vars.DEBUG
                     
-                    s = self.data.encode('utf-8') 
-                    try:     
-                        self.pipe.write(struct.pack('I', len(s)) + s)   
-                        self.pipe.seek(0)    
-                    except Exception as ex:  
-                        print("Failed to write to pipe. Is the unity project open?")
-                        self.pipe= None
+                    # Detections
+                    results = pose.process(image)
+                    tf = time.time()
+                    
+                    # Rendering results
+                    if global_vars.DEBUG:
+                        if time.time()-self.timeSincePostStatistics>=1:
+                            print("Theoretical Maximum FPS: %f"%(1/(tf-ti)))
+                            self.timeSincePostStatistics = time.time()
+                            
+                        if results.pose_landmarks:
+                            mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS, 
+                                                    mp_drawing.DrawingSpec(color=(255, 100, 0), thickness=2, circle_radius=4),
+                                                    mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=2, circle_radius=2),
+                                                    )
+                        cv2.imshow('Body Tracking', image)
+                        cv2.waitKey(1)
+
+                    if self.pipe==None and time.time()-self.timeSinceCheckedConnection>=1:
+                        try:
+                            self.pipe = open(r'\\.\pipe\UnityMediaPipeBody', 'r+b', 0)
+                        except (FileNotFoundError, OSError) as ex:
+                            print("Waiting for Unity project to run... (%s)"%ex)
+                            self.pipe = None
+                        self.timeSinceCheckedConnection = time.time()
                         
-                #time.sleep(1/20)
+                    if self.pipe != None:
+                        # Set up data for piping
+                        self.data = ""
+                        i = 0
                         
-        self.pipe.close()
-        capture.cap.release()
-        cv2.destroyAllWindows()
+                        if results.pose_world_landmarks:
+                            current_pose_time = time.time()
+                            if self.lastPoseTime is None:
+                                pose_dt = 1.0 / max(capture.cap.get(cv2.CAP_PROP_FPS), global_vars.FPS, 1)
+                            else:
+                                pose_dt = current_pose_time - self.lastPoseTime
+                            self.lastPoseTime = current_pose_time
+
+                            image_landmarks = results.pose_landmarks
+                            world_landmarks = results.pose_world_landmarks
+
+                            model_points = np.float32([[-l.x, -l.y, -l.z] for l in world_landmarks.landmark])
+                            image_points = np.float32([[l.x * image.shape[1], l.y * image.shape[0]] for l in image_landmarks.landmark])
+                            
+                            body_world_landmarks_world = self.compute_real_world_landmarks(model_points,image_points,image.shape)
+                            body_world_landmarks = results.pose_world_landmarks
+                            anchored_landmarks = np.float32([[-l.x, -l.y, -l.z] for l in body_world_landmarks.landmark])
+
+                            body_world_landmarks_world = free_smoother.apply(body_world_landmarks_world[:, :3], pose_dt)
+                            anchored_landmarks = anchored_smoother.apply(anchored_landmarks, pose_dt)
+                            
+                            for i in range(0,33):
+                                self.data += "FREE|{}|{}|{}|{}\n".format(i,body_world_landmarks_world[i][0],body_world_landmarks_world[i][1],body_world_landmarks_world[i][2])
+                            for i in range(0,33):
+                                self.data += "ANCHORED|{}|{}|{}|{}\n".format(i,anchored_landmarks[i][0],anchored_landmarks[i][1],anchored_landmarks[i][2])
+
+                        
+                        s = self.data.encode('utf-8') 
+                        try:     
+                            self.pipe.write(struct.pack('I', len(s)) + s)   
+                            self.pipe.seek(0)    
+                        except Exception as ex:  
+                            print("Failed to write to pipe. Is the unity project open?")
+                            try:
+                                self.pipe.close()
+                            except Exception:
+                                pass
+                            self.pipe= None
+                            
+                    #time.sleep(1/20)
+        finally:
+            global_vars.KILL_THREADS = True
+            if self.pipe != None:
+                self.pipe.close()
+                self.pipe = None
+            if capture.cap != None:
+                capture.cap.release()
+            cv2.destroyAllWindows()
