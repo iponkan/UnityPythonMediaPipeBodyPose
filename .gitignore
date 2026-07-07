@@ -71,3 +71,6 @@ crashlytics-build.properties
 /[Aa]ssets/[Ss]treamingAssets/aa.meta
 /[Aa]ssets/[Ss]treamingAssets/aa/*
 
+UnityMediaPipeBody/.vscode/extensions.json
+UnityMediaPipeBody/.vscode/launch.json
+UnityMediaPipeBody/.vscode/settings.json
