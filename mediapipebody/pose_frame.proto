@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package mediapipebody;
+
+message PoseFrame {
+  uint64 frame_index = 1;
+  uint64 timestamp_ms = 2;
+  repeated LandmarkSet landmark_sets = 3;
+}
+
+message LandmarkSet {
+  LandmarkSetType type = 1;
+  repeated Landmark landmarks = 2;
+}
+
+message Landmark {
+  uint32 index = 1;
+  float x = 2;
+  float y = 3;
+  float z = 4;
+}
+
+enum LandmarkSetType {
+  FREE = 0;
+  ANCHORED = 1;
+}

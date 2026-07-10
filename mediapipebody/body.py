@@ -10,6 +10,74 @@ import time
 import global_vars 
 import struct
 import math
+import socket
+
+
+LANDMARK_SET_FREE = 0
+LANDMARK_SET_ANCHORED = 1
+
+
+def _encode_varint(value):
+    value = int(value)
+    encoded = bytearray()
+    while value > 0x7F:
+        encoded.append((value & 0x7F) | 0x80)
+        value >>= 7
+    encoded.append(value)
+    return bytes(encoded)
+
+
+def _encode_key(field_number, wire_type):
+    return _encode_varint((field_number << 3) | wire_type)
+
+
+def _encode_uint64(field_number, value):
+    return _encode_key(field_number, 0) + _encode_varint(value)
+
+
+def _encode_uint32(field_number, value):
+    return _encode_key(field_number, 0) + _encode_varint(value)
+
+
+def _encode_float(field_number, value):
+    return _encode_key(field_number, 5) + struct.pack("<f", float(value))
+
+
+def _encode_message(field_number, payload):
+    return _encode_key(field_number, 2) + _encode_varint(len(payload)) + payload
+
+
+def _encode_landmark(index, x, y, z):
+    # message Landmark { uint32 index = 1; float x = 2; float y = 3; float z = 4; }
+    payload = bytearray()
+    payload += _encode_uint32(1, index)
+    payload += _encode_float(2, x)
+    payload += _encode_float(3, y)
+    payload += _encode_float(4, z)
+    return bytes(payload)
+
+
+def _encode_landmark_set(set_type, landmarks):
+    # message LandmarkSet { LandmarkSetType type = 1; repeated Landmark landmarks = 2; }
+    payload = bytearray()
+    payload += _encode_uint32(1, set_type)
+    for index, point in enumerate(landmarks):
+        payload += _encode_message(2, _encode_landmark(index, point[0], point[1], point[2]))
+    return bytes(payload)
+
+
+def encode_pose_frame_protobuf(frame_index, timestamp_ms, free_landmarks, anchored_landmarks):
+    # message PoseFrame {
+    #   uint64 frame_index = 1;
+    #   uint64 timestamp_ms = 2;
+    #   repeated LandmarkSet landmark_sets = 3;
+    # }
+    payload = bytearray()
+    payload += _encode_uint64(1, frame_index)
+    payload += _encode_uint64(2, timestamp_ms)
+    payload += _encode_message(3, _encode_landmark_set(LANDMARK_SET_FREE, free_landmarks))
+    payload += _encode_message(3, _encode_landmark_set(LANDMARK_SET_ANCHORED, anchored_landmarks))
+    return bytes(payload)
 
 
 class LowPassFilter:
@@ -117,9 +185,46 @@ class BodyThread(threading.Thread):
     data = ""
     dirty = True
     pipe = None
+    udp_socket = None
+    udp_target = None
     timeSinceCheckedConnection = 0
     timeSincePostStatistics = 0
     lastPoseTime = None
+    frameIndex = 0
+
+    def __init__(self):
+        super().__init__()
+        self.init_udp_socket()
+
+    def init_udp_socket(self):
+        if not getattr(global_vars, "UDP_ENABLED", False):
+            return
+
+        self.udp_target = (
+            getattr(global_vars, "UDP_TARGET_IP", "127.0.0.1"),
+            int(getattr(global_vars, "UDP_TARGET_PORT", 9999))
+        )
+        try:
+            self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            print("UDP pose output enabled: %s:%s" % self.udp_target)
+        except OSError as ex:
+            print("Failed to initialize UDP socket: %s" % ex)
+            self.udp_socket = None
+            self.udp_target = None
+
+    def send_udp_pose_frame(self, payload):
+        if self.udp_socket is None or self.udp_target is None or not payload:
+            return
+
+        try:
+            self.udp_socket.sendto(payload, self.udp_target)
+        except OSError as ex:
+            print("Failed to send UDP pose frame: %s" % ex)
+
+    def close_udp_socket(self):
+        if self.udp_socket is not None:
+            self.udp_socket.close()
+            self.udp_socket = None
 
     def compute_real_world_landmarks(self,world_landmarks,image_landmarks,image_shape):
         try:
@@ -211,39 +316,47 @@ class BodyThread(threading.Thread):
                             print("Waiting for Unity project to run... (%s)"%ex)
                             self.pipe = None
                         self.timeSinceCheckedConnection = time.time()
-                        
+
+                    # Set up the current frame once, then fan it out to pipe and UDP.
+                    self.data = ""
+                    udp_payload = None
+                    i = 0
+
+                    if results.pose_world_landmarks and results.pose_landmarks:
+                        current_pose_time = time.time()
+                        if self.lastPoseTime is None:
+                            pose_dt = 1.0 / max(capture.cap.get(cv2.CAP_PROP_FPS), global_vars.FPS, 1)
+                        else:
+                            pose_dt = current_pose_time - self.lastPoseTime
+                        self.lastPoseTime = current_pose_time
+
+                        image_landmarks = results.pose_landmarks
+                        world_landmarks = results.pose_world_landmarks
+
+                        model_points = np.float32([[-l.x, -l.y, -l.z] for l in world_landmarks.landmark])
+                        image_points = np.float32([[l.x * image.shape[1], l.y * image.shape[0]] for l in image_landmarks.landmark])
+
+                        body_world_landmarks_world = self.compute_real_world_landmarks(model_points,image_points,image.shape)
+                        body_world_landmarks = results.pose_world_landmarks
+                        anchored_landmarks = np.float32([[-l.x, -l.y, -l.z] for l in body_world_landmarks.landmark])
+
+                        body_world_landmarks_world = free_smoother.apply(body_world_landmarks_world[:, :3], pose_dt)
+                        anchored_landmarks = anchored_smoother.apply(anchored_landmarks, pose_dt)
+
+                        for i in range(0,33):
+                            self.data += "FREE|{}|{}|{}|{}\n".format(i,body_world_landmarks_world[i][0],body_world_landmarks_world[i][1],body_world_landmarks_world[i][2])
+                        for i in range(0,33):
+                            self.data += "ANCHORED|{}|{}|{}|{}\n".format(i,anchored_landmarks[i][0],anchored_landmarks[i][1],anchored_landmarks[i][2])
+
+                        self.frameIndex += 1
+                        udp_payload = encode_pose_frame_protobuf(
+                            self.frameIndex,
+                            int(current_pose_time * 1000),
+                            body_world_landmarks_world,
+                            anchored_landmarks
+                        )
+
                     if self.pipe != None:
-                        # Set up data for piping
-                        self.data = ""
-                        i = 0
-                        
-                        if results.pose_world_landmarks:
-                            current_pose_time = time.time()
-                            if self.lastPoseTime is None:
-                                pose_dt = 1.0 / max(capture.cap.get(cv2.CAP_PROP_FPS), global_vars.FPS, 1)
-                            else:
-                                pose_dt = current_pose_time - self.lastPoseTime
-                            self.lastPoseTime = current_pose_time
-
-                            image_landmarks = results.pose_landmarks
-                            world_landmarks = results.pose_world_landmarks
-
-                            model_points = np.float32([[-l.x, -l.y, -l.z] for l in world_landmarks.landmark])
-                            image_points = np.float32([[l.x * image.shape[1], l.y * image.shape[0]] for l in image_landmarks.landmark])
-                            
-                            body_world_landmarks_world = self.compute_real_world_landmarks(model_points,image_points,image.shape)
-                            body_world_landmarks = results.pose_world_landmarks
-                            anchored_landmarks = np.float32([[-l.x, -l.y, -l.z] for l in body_world_landmarks.landmark])
-
-                            body_world_landmarks_world = free_smoother.apply(body_world_landmarks_world[:, :3], pose_dt)
-                            anchored_landmarks = anchored_smoother.apply(anchored_landmarks, pose_dt)
-                            
-                            for i in range(0,33):
-                                self.data += "FREE|{}|{}|{}|{}\n".format(i,body_world_landmarks_world[i][0],body_world_landmarks_world[i][1],body_world_landmarks_world[i][2])
-                            for i in range(0,33):
-                                self.data += "ANCHORED|{}|{}|{}|{}\n".format(i,anchored_landmarks[i][0],anchored_landmarks[i][1],anchored_landmarks[i][2])
-
-                        
                         s = self.data.encode('utf-8') 
                         try:     
                             self.pipe.write(struct.pack('I', len(s)) + s)   
@@ -255,6 +368,8 @@ class BodyThread(threading.Thread):
                             except Exception:
                                 pass
                             self.pipe= None
+
+                    self.send_udp_pose_frame(udp_payload)
                             
                     #time.sleep(1/20)
         finally:
@@ -262,6 +377,7 @@ class BodyThread(threading.Thread):
             if self.pipe != None:
                 self.pipe.close()
                 self.pipe = None
+            self.close_udp_socket()
             if capture.cap != None:
                 capture.cap.release()
             cv2.destroyAllWindows()
